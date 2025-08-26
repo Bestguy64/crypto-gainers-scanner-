@@ -1,0 +1,9 @@
+﻿ccxt
+pandas
+numpy
+pandas-ta
+python-telegram-bot>=20.0
+aiohttp
+python-dotenv
+requests
+schedule
