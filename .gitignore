@@ -4,8 +4,8 @@ __pycache__/
 .venv/
 .env
 *.log
+alerts.db
 
 # OS
 .DS_Store
 Thumbs.db
-
