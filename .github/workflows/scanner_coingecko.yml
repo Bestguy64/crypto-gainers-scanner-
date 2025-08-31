@@ -1,4 +1,4 @@
-﻿name: Crypto Coingecko Scanner
+﻿name: Crypto Coingecko Scanner (Supabase + Exchange)
 
 on:
   schedule:
@@ -22,9 +22,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Coingecko stateless scanner
+      - name: Run Supabase-backed scanner (try exchange then fallback)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          python scanner_coingecko_only.py
+          python scanner_supabase.py
