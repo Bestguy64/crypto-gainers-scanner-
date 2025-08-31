@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
+from urllib.parse import urlparse
+import socket
+
 
 load_dotenv()
 
@@ -36,8 +39,37 @@ SLEEP_BETWEEN_SYMBOLS = 0.5
 
 # --- Postgres helpers
 def get_conn():
-    # use sslmode=require in URL; psycopg2 will honor it
-    return psycopg2.connect(SUPABASE_DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    """
+    Parse SUPABASE_DB_URL and connect using an IPv4 address if possible.
+    This avoids flaky IPv6 routing on some runners.
+    """
+    # parse the URL
+    parsed = urlparse(SUPABASE_DB_URL)
+    user = parsed.username
+    password = parsed.password
+    host = parsed.hostname
+    port = parsed.port or 5432
+    dbname = parsed.path.lstrip("/") or "postgres"
+
+    # try to resolve an IPv4 address for the host; fall back to hostname if resolution fails
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        ipv4 = infos[0][4][0]  # first IPv4 address
+    except Exception:
+        ipv4 = host
+
+    # connect by passing explicit connection parameters and forcing sslmode=require
+    conn = psycopg2.connect(
+        host=ipv4,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+        sslmode="require",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+    return conn
+
 
 def ensure_table():
     sql = """
