@@ -7,3 +7,7 @@ aiohttp
 python-dotenv
 requests
 schedule
+psycopg2-binary
+
+
+psycopg2-binary
