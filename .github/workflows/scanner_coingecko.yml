@@ -1,9 +1,9 @@
-﻿name: Crypto Coingecko Scanner (Supabase + Exchange)
+﻿name: Crypto Coingecko Scanner (Supabase REST)
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # every 10 minutes
-  workflow_dispatch:         # manual trigger allowed
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -22,10 +22,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Supabase-backed scanner (try exchange then fallback)
+      - name: Run Supabase-backed scanner (REST)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          python scanner_supabase.py
+          python scanner_supabase_http.py
