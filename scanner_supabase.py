@@ -1,4 +1,9 @@
 # scanner_supabase.py
+# Supabase-backed crypto scanner
+# - prefers IPv4 when connecting to Postgres to avoid IPv6 routing failures on CI/runners
+# - tries exchange OHLCV via CCXT (Binance) and falls back to CoinGecko-only alerts
+# - dedupes alerts by inserting into a Postgres table in Supabase
+
 import os
 import time
 import requests
@@ -10,7 +15,7 @@ import psycopg2
 import psycopg2.extras
 from urllib.parse import urlparse
 import socket
-
+import sys
 
 load_dotenv()
 
@@ -36,40 +41,81 @@ RSI_LOWER = 20
 RSI_UPPER = 85
 OHLCV_LIMIT = 500
 SLEEP_BETWEEN_SYMBOLS = 0.5
+CONNECT_TIMEOUT = 10  # seconds for DB connect attempts
+IPV4_CONNECT_ATTEMPTS = 3
 
 # --- Postgres helpers
-def get_conn():
-    """
-    Parse SUPABASE_DB_URL and connect using an IPv4 address if possible.
-    This avoids flaky IPv6 routing on some runners.
-    """
-    # parse the URL
-    parsed = urlparse(SUPABASE_DB_URL)
-    user = parsed.username
-    password = parsed.password
-    host = parsed.hostname
-    port = parsed.port or 5432
-    dbname = parsed.path.lstrip("/") or "postgres"
+def parse_db_url(url):
+    p = urlparse(url)
+    username = p.username
+    password = p.password
+    hostname = p.hostname
+    port = p.port or 5432
+    dbname = p.path.lstrip('/') or "postgres"
+    return username, password, hostname, port, dbname
 
-    # try to resolve an IPv4 address for the host; fall back to hostname if resolution fails
+def try_connect_ipv4(username, password, host, port, dbname):
+    """
+    Resolve IPv4 addresses for host and try to connect to each one.
+    Returns a live connection or raises the last exception.
+    """
+    last_exc = None
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        ipv4 = infos[0][4][0]  # first IPv4 address
-    except Exception:
-        ipv4 = host
+    except Exception as e:
+        # no IPv4 addresses found
+        infos = []
 
-    # connect by passing explicit connection parameters and forcing sslmode=require
-    conn = psycopg2.connect(
-        host=ipv4,
-        port=port,
-        dbname=dbname,
-        user=user,
-        password=password,
-        sslmode="require",
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
-    return conn
+    # iterate unique IPv4 addresses
+    seen = set()
+    for info in infos:
+        addr = info[4][0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        for attempt in range(IPV4_CONNECT_ATTEMPTS):
+            try:
+                print(f"[DB] Trying IPv4 connect to {addr}:{port} (attempt {attempt+1})", flush=True)
+                conn = psycopg2.connect(
+                    host=addr,
+                    port=port,
+                    dbname=dbname,
+                    user=username,
+                    password=password,
+                    sslmode="require",
+                    connect_timeout=CONNECT_TIMEOUT,
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                )
+                print(f"[DB] Connected to {addr}", flush=True)
+                return conn
+            except Exception as e:
+                last_exc = e
+                print(f"[DB] IPv4 connect to {addr} failed: {e}", flush=True)
+                time.sleep(1)
+    # If no IPv4 worked, raise last exception
+    if last_exc:
+        raise last_exc
+    # No IPv4 addresses at all, raise to allow fallback
+    raise RuntimeError("No IPv4 addresses found for host")
 
+def get_conn():
+    """
+    Connect to Postgres using IPv4 if possible; fall back to original URL connect.
+    """
+    username, password, host, port, dbname = parse_db_url(SUPABASE_DB_URL)
+    # first try IPv4-based connects
+    try:
+        return try_connect_ipv4(username, password, host, port, dbname)
+    except Exception as e:
+        print(f"[DB] IPv4 connection attempts failed: {e}. Falling back to direct DSN connect (may use IPv6).", flush=True)
+        # fallback: try standard psycopg2.connect with DSN (this mirrors SUPABASE_DB_URL)
+        try:
+            conn = psycopg2.connect(SUPABASE_DB_URL, cursor_factory=psycopg2.extras.RealDictCursor, connect_timeout=CONNECT_TIMEOUT)
+            print("[DB] Connected via DSN fallback", flush=True)
+            return conn
+        except Exception as e2:
+            print(f"[DB] DSN fallback also failed: {e2}", flush=True)
+            raise
 
 def ensure_table():
     sql = """
@@ -87,13 +133,15 @@ def ensure_table():
         with conn.cursor() as cur:
             cur.execute(sql)
             conn.commit()
+    print("[DB] ensured alerts table exists", flush=True)
 
 def was_alerted_recent(coin_id, hours=6):
     sql = "SELECT 1 FROM alerts WHERE coin_id = %s AND alert_time >= (now() - (%s || ' hours')::interval) LIMIT 1"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (coin_id, hours))
-            return cur.fetchone() is not None
+            found = cur.fetchone() is not None
+            return found
 
 def record_alert(coin_id, symbol, alert_type, pct, volume):
     sql = "INSERT INTO alerts (coin_id, symbol, alert_type, pct, volume, alert_time) VALUES (%s, %s, %s, %s, %s, now())"
@@ -111,7 +159,7 @@ def send_telegram(text):
         r.raise_for_status()
         return True
     except Exception as e:
-        print("Telegram send error:", e)
+        print("Telegram send error:", e, flush=True)
         return False
 
 # --- CoinGecko / exchange helpers
@@ -138,6 +186,7 @@ def map_to_exchange_symbols(exchange, coin_list):
             if c in markets:
                 mapped.append((coin, c))
                 break
+    print(f"Mapped {len(mapped)} symbols to exchange markets", flush=True)
     return mapped
 
 def fetch_ohlcv_for_symbol(exchange, symbol, timeframe='1m', limit=OHLCV_LIMIT):
@@ -150,7 +199,7 @@ def fetch_ohlcv_for_symbol(exchange, symbol, timeframe='1m', limit=OHLCV_LIMIT):
         df.set_index('datetime', inplace=True)
         return df[['open','high','low','close','volume']]
     except Exception as e:
-        print("fetch_ohlcv error for", symbol, e)
+        print("fetch_ohlcv error for", symbol, e, flush=True)
         return None
 
 def compute_indicators(df):
@@ -184,22 +233,21 @@ def compute_indicators(df):
     }
 
 def scan_once():
-    print("Starting scan")
+    print("Starting scan", flush=True)
     markets = coingecko_top_markets(COINGECKO_TOP)
-    # filter by 24h pct and volume early to reduce load
     candidates = [m for m in markets if (m.get("price_change_percentage_24h") or 0) >= MIN_24H_PCT and (m.get("total_volume") or 0) >= MIN_VOLUME_USD]
-    print("Candidates after CG filter:", len(candidates))
-    # try to map to exchange markets via Binance where possible
+    print("Candidates after CG filter:", len(candidates), flush=True)
+
     exchange = ccxt.binance({"enableRateLimit": True})
+    mapped = []
     try:
         exchange.load_markets()
         mapped = map_to_exchange_symbols(exchange, candidates)
     except Exception as e:
-        print("Exchange load error, will skip exchange symbol matching", e)
-        mapped = []  # fallback to CoinGecko-only path below
+        print("Exchange load error, will skip exchange symbol matching", e, flush=True)
+        mapped = []
 
     alerts_sent = []
-    # If we could map to exchange symbols, we will use them to compute indicators
     for coin, symbol in mapped:
         time.sleep(SLEEP_BETWEEN_SYMBOLS)
         df = fetch_ohlcv_for_symbol(exchange, symbol, timeframe='1m', limit=OHLCV_LIMIT)
@@ -214,7 +262,7 @@ def scan_once():
         if vol_ok and breakout_ok and rsi_ok:
             coin_id = coin.get("id")
             if was_alerted_recent(coin_id):
-                print("SKIP recent alert", coin_id)
+                print("SKIP recent alert", coin_id, flush=True)
                 continue
             text = (
                 f"ALERT {symbol}\n"
@@ -230,7 +278,7 @@ def scan_once():
             if ok:
                 record_alert(coin_id, coin.get("symbol").upper(), "indicator", ind['vol_gain_pct'], ind.get('last_close'))
                 alerts_sent.append(coin_id)
-    # fallback CoinGecko-only alerts for coins we could not map or compute indicators for
+
     for coin in markets:
         coin_id = coin.get("id")
         if coin_id in alerts_sent:
@@ -251,7 +299,8 @@ def scan_once():
             if ok:
                 record_alert(coin_id, coin.get("symbol","").upper(), "24h_pct", pct, vol)
                 alerts_sent.append(coin_id)
-    print("Done. Alerts sent:", alerts_sent)
+
+    print("Done. Alerts sent:", alerts_sent, flush=True)
     return alerts_sent
 
 if __name__ == "__main__":
