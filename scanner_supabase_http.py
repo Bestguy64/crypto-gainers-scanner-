@@ -1,9 +1,9 @@
-﻿# scanner_supabase_http.py
-# Multi-exchange REST-backed crypto scanner with TradingView-style filters
-# - tries multiple exchanges (EXCHANGES env) to find USDT/BUSD/USD markets
-# - computes indicators (24h vol change, 15m vs 1h price, RSI(1h), MACD(1h))
-# - writes deduped alerts to Supabase via REST and sends Telegram messages
-# - requires SUPABASE_URL and SUPABASE_SERVICE_KEY for REST access (service role key)
+# scanner_supabase_http.py
+# Multi-exchange, exchange-sourced candidate scanner
+# - scans all USDT/BUSD/USD spot markets across exchanges listed in EXCHANGES env
+# - computes TradingView-style filters: vol%24h, price 15m vs 1h, RSI(1h), MACD(1h)
+# - writes deduped alerts to Supabase via REST (service role key) and sends Telegram messages
+# - coin_id used for dedupe: "<exchange>:<base>"
 
 import os
 import time
@@ -13,21 +13,20 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-# TA indicators
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 
 load_dotenv()
 
-# --- Env / config
+# --- Env / config (required)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SUPABASE_URL = os.getenv("SUPABASE_URL")               # e.g. https://<project-ref>.supabase.co
+SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-EXCHANGES = os.getenv("EXCHANGES", "binance")         # comma-separated list, e.g. "binance,bitget,okx,bybit"
+EXCHANGES = os.getenv("EXCHANGES", "binance")  # repo variable recommended
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise SystemExit("Set TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY in environment")
+    raise SystemExit("Set TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY in environment or repo variables")
 
 TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID)
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -39,19 +38,17 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-# ----- Scanner tuning (from your TradingView-style rules)
-COINGECKO_TOP = 200
-MIN_VOLUME_USD = 10000          # baseline liquidity; increase if needed
+# ----- Scanner tuning (changeable)
 DEDUPE_HOURS = 6
-SLEEP_BETWEEN_SYMBOLS = 0.4     # increase if you add many exchanges
-OHLCV_LIMIT_1H = 72             # hours of 1h bars (72 = 3 days)
-OHLCV_LIMIT_15M = 8             # ~2 hours of 15m bars
+SLEEP_BETWEEN_SYMBOLS = 0.4
+MIN_VOLUME_USD = 10000           # baseline liquidity for candidate markets
+OHLCV_LIMIT_1H = 72              # hours of 1h bars
+OHLCV_LIMIT_15M = 8              # 15m bars
 VOL_CHANGE_THRESHOLD_PCT = 150.0
 PRICE_MIN_PCT = 3.0
 PRICE_MAX_PCT = 15.0
 RSI_LOW = 50.0
 RSI_HIGH = 70.0
-
 REQUEST_TIMEOUT = 15
 
 # ----- Supabase REST helpers
@@ -67,7 +64,6 @@ def was_alerted_recent(coin_id, hours=DEDUPE_HOURS):
         r.raise_for_status()
         return len(r.json()) > 0
     except Exception as e:
-        # if Supabase is temporarily unreachable, default to not alerted to avoid missing alerts later
         print("[DB] was_alerted_recent error:", e, flush=True)
         return False
 
@@ -100,15 +96,7 @@ def send_telegram(text):
         print("Telegram send error:", e, flush=True)
         return False
 
-# ----- CoinGecko
-def coingecko_top_markets(limit=COINGECKO_TOP):
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {"vs_currency":"usd","order":"market_cap_desc","per_page":min(limit,250),"page":1,"price_change_percentage":"24h"}
-    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-# ----- Multi-exchange setup and mapping
+# ----- Exchange helpers
 def build_exchange_instances():
     ex_names = [e.strip() for e in EXCHANGES.split(",") if e.strip()]
     instances = {}
@@ -120,42 +108,41 @@ def build_exchange_instances():
         except Exception as e:
             print(f"[EXCH] Could not prepare ccxt exchange '{name}': {e}", flush=True)
     if not instances:
-        # fallback to binance if nothing valid
         instances["binance"] = ccxt.binance({"enableRateLimit": True})
     return instances
 
-def map_to_exchange_symbols_multi(exchange_instances, coin_list):
+def build_candidates_from_exchanges(exchange_instances):
     """
-    Return list of tuples: (coin, symbol, exchange_name)
+    Build candidate list from exchange markets: returns list of dicts:
+    { "exchange": ex_name, "market": market_symbol, "base": base, "quote": quote, "volume": 24h_volume_estimate }
     """
-    markets_by_ex = {}
+    candidates = []
     for name, ex in exchange_instances.items():
         try:
             ex.load_markets()
-            markets_by_ex[name] = ex.markets  # mapping of normalized symbol -> market info
-            print(f"[EXCH] Loaded markets for {name}, markets={len(ex.markets)}", flush=True)
         except Exception as e:
-            print(f"[EXCH] Failed loading markets for {name}: {e}", flush=True)
-
-    mapped = []
-    for coin in coin_list:
-        sym = (coin.get("symbol") or "").upper()
-        if not sym:
+            print(f"[EXCH] Failed load_markets for {name}: {e}", flush=True)
             continue
-        candidates = [f"{sym}/USDT", f"{sym}/BUSD", f"{sym}/USD"]
-        matched = False
-        for ex_name, markets in markets_by_ex.items():
-            for c in candidates:
-                if c in markets:
-                    mapped.append((coin, c, ex_name))
-                    matched = True
-                    break
-            if matched:
-                break
-    print(f"[MAPPING] Mapped {len(mapped)} symbols across exchanges", flush=True)
-    return mapped
+        # markets is dict: 'BASE/QUOTE' -> market
+        for m_sym, m in ex.markets.items():
+            # some markets have .get('spot') flag; we only want spot markets
+            # prefer quote USDT/BUSD/USD
+            quote = m_sym.split("/")[-1] if "/" in m_sym else None
+            if quote not in ("USDT", "BUSD", "USD"):
+                continue
+            base = m_sym.split("/")[0]
+            # estimate volume if market info provides it (not guaranteed)
+            vol = None
+            try:
+                info = m.get("info", {}) or {}
+                # try to get 24h volume in quote or base depending on exchange
+                vol = info.get("quoteVolume") or info.get("volume") or info.get("quoteVolume24h") or None
+            except Exception:
+                vol = None
+            candidates.append({"exchange": name, "market": m_sym, "base": base, "quote": quote, "volume": vol})
+    print(f"[CAND] Built {len(candidates)} exchange-sourced candidates", flush=True)
+    return candidates
 
-# ----- OHLCV fetch
 def fetch_ohlcv(exchange, symbol, timeframe='1h', limit=100):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -169,7 +156,7 @@ def fetch_ohlcv(exchange, symbol, timeframe='1h', limit=100):
         print(f"[EXCH] fetch_ohlcv error for {symbol} on {getattr(exchange, 'id', 'unknown')}: {e}", flush=True)
         return None
 
-# ----- Indicator computation (same logic as before)
+# ----- Indicators
 def compute_signals(df1h, df15m):
     results = {
         "vol_pct_24h": None,
@@ -185,7 +172,6 @@ def compute_signals(df1h, df15m):
     except Exception:
         pass
 
-    # Volume % change (24h): need at least 48 hours of 1h bars
     if df1h is not None and len(df1h) >= 48:
         try:
             vol_last24 = df1h['volume'].iloc[-24:].sum()
@@ -195,7 +181,6 @@ def compute_signals(df1h, df15m):
         except Exception:
             results['vol_pct_24h'] = None
 
-    # Price % change (15m vs 1h), use last 15m close vs previous 1h close
     if df15m is not None and not df15m.empty and df1h is not None and len(df1h) >= 2:
         try:
             close_15m = float(df15m['close'].iloc[-1])
@@ -204,7 +189,6 @@ def compute_signals(df1h, df15m):
         except Exception:
             results['price_pct_15_vs_1h'] = None
 
-    # RSI (1h)
     if df1h is not None and len(df1h) >= 20:
         try:
             rsi = RSIIndicator(df1h['close'], window=14).rsi()
@@ -212,7 +196,6 @@ def compute_signals(df1h, df15m):
         except Exception:
             results['rsi_1h'] = None
 
-    # MACD (1h) bullish crossover
     if df1h is not None and len(df1h) >= 35:
         try:
             macd = MACD(df1h['close'], window_slow=26, window_fast=12, window_sign=9)
@@ -229,42 +212,47 @@ def compute_signals(df1h, df15m):
 
     return results
 
-# ----- Main scanning logic
+# ----- Main scanning logic (exchange-sourced candidates)
 def scan_once():
     print(f"[SCAN] Starting scan {datetime.now(timezone.utc).isoformat()}", flush=True)
-    markets = coingecko_top_markets(COINGECKO_TOP)
-    candidates = [m for m in markets if (m.get("total_volume") or 0) >= MIN_VOLUME_USD]
-    print(f"[SCAN] Candidates after CG volume filter: {len(candidates)}", flush=True)
-
     exch_instances = build_exchange_instances()
-    mapped = map_to_exchange_symbols_multi(exch_instances, candidates)
-    if not mapped:
-        print("[SCAN] No mapped exchange symbols found. Exiting.", flush=True)
-        return []
+    candidates = build_candidates_from_exchanges(exch_instances)
+
+    # quick filter by baseline 24h volume estimate if available
+    filtered = []
+    for c in candidates:
+        vol = c.get("volume")
+        if vol is None:
+            filtered.append(c)  # keep unknown-volume markets (we will compute from OHLCV)
+            continue
+        try:
+            v = float(vol)
+            if v >= MIN_VOLUME_USD:
+                filtered.append(c)
+        except Exception:
+            filtered.append(c)
+    print(f"[SCAN] Candidates after baseline filter: {len(filtered)}", flush=True)
 
     alerts_sent = []
-    for coin, symbol, ex_name in mapped:
-        time.sleep(SLEEP_BETWEEN_SYMBOLS)
+    for c in filtered:
+        ex_name = c['exchange']
+        symbol = c['market']
+        base = c['base']
         exchange = exch_instances.get(ex_name)
         if exchange is None:
-            print(f"[SCAN] Skipping {symbol}: no exchange instance for {ex_name}", flush=True)
             continue
+        time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
-        # prefer strict USDT pairs (you can allow BUSD/USD by removing this check)
-        if not symbol.endswith("/USDT"):
-            # optional: continue to include BUSD/USD pairs; here we still accept them
-            pass
-
+        # fetch OHLCV
         df1h = fetch_ohlcv(exchange, symbol, timeframe='1h', limit=OHLCV_LIMIT_1H)
         df15m = fetch_ohlcv(exchange, symbol, timeframe='15m', limit=OHLCV_LIMIT_15M)
         if df1h is None or df15m is None:
-            print(f"[SCAN] Skipping {symbol}: missing OHLCV data", flush=True)
+            print(f"[SCAN] Skipping {symbol}@{ex_name}: missing OHLCV", flush=True)
             continue
 
         sig = compute_signals(df1h, df15m)
-        # must have core metrics
         if sig['vol_pct_24h'] is None or sig['price_pct_15_vs_1h'] is None or sig['rsi_1h'] is None:
-            print(f"[SCAN] Skipping {symbol}: insufficient metrics {sig}", flush=True)
+            print(f"[SCAN] Skipping {symbol}@{ex_name}: insufficient metrics {sig}", flush=True)
             continue
 
         vol_ok = sig['vol_pct_24h'] >= VOL_CHANGE_THRESHOLD_PCT
@@ -275,23 +263,24 @@ def scan_once():
         print(f"[SIGNAL] {symbol}@{ex_name} vol%={sig['vol_pct_24h']:.1f} price15vs1h={sig['price_pct_15_vs_1h']:.2f} rsi1h={sig['rsi_1h']} macd={sig['macd_bull_cross']}", flush=True)
 
         if vol_ok and price_ok and rsi_ok and macd_ok:
-            coin_id = coin.get("id")
+            coin_id = f"{ex_name}:{base}"
             if was_alerted_recent(coin_id):
                 print(f"[SCAN] SKIP recent alert {coin_id}", flush=True)
                 continue
             text = (
                 f"ALERT {symbol} ({ex_name})\n"
-                f"Name: {coin.get('name')} ({coin.get('symbol').upper()})\n"
+                f"Pair: {symbol}\n"
                 f"Price: ${sig['last_close']:.8f}\n"
                 f"Vol change 24h: {sig['vol_pct_24h']:.1f}%\n"
                 f"Price 15m vs 1h: {sig['price_pct_15_vs_1h']:.2f}%\n"
                 f"RSI 1h: {sig['rsi_1h']:.1f}\n"
                 f"MACD bullish crossover: {sig['macd_bull_cross']}\n"
-                f"https://www.coingecko.com/en/coins/{coin.get('id')}"
+                f"Exchange: {ex_name}\n"
+                f"Symbol: {symbol}"
             )
             ok = send_telegram(text)
             if ok:
-                record_alert(coin_id, coin.get("symbol").upper(), "multi_ex_tv", sig['price_pct_15_vs_1h'], sig['vol_pct_24h'])
+                record_alert(coin_id, symbol, "exchange_multi_tv", sig['price_pct_15_vs_1h'], sig['vol_pct_24h'])
                 alerts_sent.append(coin_id)
 
     print(f"[SCAN] Done. Alerts sent: {alerts_sent}", flush=True)
